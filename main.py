@@ -1,4 +1,4 @@
-import csv
+import psycopg2
 import datetime
 import re
 from selenium import webdriver
@@ -6,8 +6,19 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
 # Scraper Modülleri
+# Not: scrapers klasöründeki migros.py ve a101.py dosyalarınızın yanına dokunmanıza gerek yok.
 from scrapers.migros import scrape_migros
 from scrapers.a101 import scrape_a101
+
+# --- VERİTABANI AYARLARI ---
+# Kurulumda belirlediğin şifreyi 'password' kısmına yazmalısın.
+DB_PARAMS = {
+    "dbname": "inflation_monitor",
+    "user": "postgres",
+    "password": "admin",
+    "host": "localhost",
+    "port": "5432"
+}
 
 
 # --- YARDIMCI FONKSİYONLAR ---
@@ -27,7 +38,8 @@ def clean_price(price_text):
 
 def extract_unit_price(product_name, price):
     """
-    V4.0: Multipack (4x1), Yumurta ve Gramaj hesaplama motoru.
+    Birim fiyat hesaplama motoru.
+    Multipack (4x1), Yumurta ve Gramaj hesaplar.
     """
     name_lower = product_name.lower().replace("İ", "i").replace("I", "ı").replace(" ", "").replace(",", ".")
 
@@ -45,7 +57,6 @@ def extract_unit_price(product_name, price):
 
         total_amount = count * amount
         if total_amount > 0:
-            # print(f"   🔢 Multipack: {product_name} -> {count}x{amount} = {total_amount} Birim")
             return round(price / total_amount, 2)
 
     # 2. YUMURTA KURALI (Adet hesabı)
@@ -81,35 +92,105 @@ def extract_unit_price(product_name, price):
     return price
 
 
-def save_to_csv(data):
-    """Verileri CSV dosyasına kaydeder."""
-    file_exists = False
+# --- POSTGRESQL VERİTABANI İŞLEMLERİ ---
+
+def init_db():
+    """PostgreSQL tablosunu oluşturur (Eğer yoksa)."""
     try:
-        with open('market_data.csv', 'r', encoding='utf-8') as f:
-            file_exists = True
-    except FileNotFoundError:
-        pass
+        conn = psycopg2.connect(**DB_PARAMS)
+        cur = conn.cursor()
 
-    with open('market_data.csv', 'a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        # Dosya yoksa başlıkları yaz
-        if not file_exists:
-            writer.writerow(["Tarih", "Market", "Kategori", "Ürün Adı", "Raf Fiyatı", "Birim Fiyat (TL/Kg-L)", "Birim"])
+        # PostgreSQL'de AUTOINCREMENT yerine SERIAL kullanılır
+        cur.execute('''
+                    CREATE TABLE IF NOT EXISTS prices
+                    (
+                        id
+                        SERIAL
+                        PRIMARY
+                        KEY,
+                        date
+                        DATE,
+                        market
+                        VARCHAR
+                    (
+                        50
+                    ),
+                        category VARCHAR
+                    (
+                        100
+                    ),
+                        product_name TEXT,
+                        price NUMERIC
+                    (
+                        10,
+                        2
+                    ),
+                        unit_price NUMERIC
+                    (
+                        10,
+                        2
+                    ),
+                        unit VARCHAR
+                    (
+                        20
+                    )
+                        )
+                    ''')
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("🐘 PostgreSQL veritabanı bağlantısı başarılı ve tablo hazır.")
+    except Exception as e:
+        print(f"❌ Veritabanı Bağlantı Hatası: {e}")
+        print(
+            "💡 İPUCU: pgAdmin'den 'inflation_monitor' adında bir veritabanı oluşturduğuna ve şifrenin doğru olduğuna emin ol.")
 
-        for row in data:
-            writer.writerow(row)
-    print(f"\n💾 Toplam {len(data)} satır veri 'market_data.csv' dosyasına eklendi.")
+
+def save_to_db(data):
+    """Verileri PostgreSQL veritabanına kaydeder."""
+    if not data:
+        return
+
+    try:
+        conn = psycopg2.connect(**DB_PARAMS)
+        cur = conn.cursor()
+
+        # PostgreSQL placeholder'ı %s dir. SQLite'taki ? çalışmaz.
+        query = '''
+                INSERT INTO prices (date, market, category, product_name, price, unit_price, unit)
+                VALUES (%s, %s, %s, %s, %s, %s, %s) \
+                '''
+
+        # executemany ile toplu ve hızlı kayıt
+        cur.executemany(query, data)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"\n🚀 Toplam {len(data)} satır veri PostgreSQL veritabanına başarıyla eklendi.")
+    except Exception as e:
+        print(f"❌ Kayıt Hatası: {e}")
 
 
 # --- ANA PROGRAM BAŞLANGICI ---
 if __name__ == "__main__":
 
+    # 1. Veritabanını Başlat / Kontrol Et
+    init_db()
+
     options = webdriver.ChromeOptions()
-    options.add_argument("--start-maximized")
+    # Headless Mod: Tarayıcıyı ekranda açmaz, arka planda çalışır (Daha hızlı ve profesyonel)
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
 
-    # EAGER MODE: Sayfanın %100 yüklenmesini bekleme, HTML gelince başla (Hızlandırır)
+    # Anti-Bot: Gerçek kullanıcı gibi görünmek için User-Agent
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    # EAGER MODE: Sayfa yüklenmesini bekleme stratejisi
     options.page_load_strategy = 'eager'
 
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
@@ -119,17 +200,18 @@ if __name__ == "__main__":
     today = datetime.date.today().strftime("%Y-%m-%d")
 
     try:
-
+        # Migros Taraması
         try:
             scrape_migros(driver, all_products, clean_price, extract_unit_price, today)
         except Exception as e:
             print(f"❌ Migros Hatası: {e}")
 
 
-        #try:
-            #scrape_a101(driver, all_products, clean_price, extract_unit_price, today)
-        #except Exception as e:
-            #print(f"❌ A101 Hatası: {e}")
+        try:
+
+            scrape_a101(driver, all_products, clean_price, extract_unit_price, today)
+        except Exception as e:
+            print(f"❌ A101 Hatası: {e}")
 
     except Exception as main_e:
         print(f"❌ Genel Hata: {main_e}")
@@ -138,7 +220,7 @@ if __name__ == "__main__":
         driver.quit()
 
         if all_products:
-            save_to_csv(all_products)
+            save_to_db(all_products)  # Artık CSV değil, DB'ye kaydediyoruz
             print("✅ İşlem Başarıyla Tamamlandı.")
         else:
             print("⚠️ Hiç veri toplanmadı.")
